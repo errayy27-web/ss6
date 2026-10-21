@@ -1,72 +1,65 @@
-"""SS OIL read-only LAN API. SQL Server 2005; requires pyodbc and an ODBC driver.
-No SQL modifications; credentials are read from environment variables.
-"""
+"""SS OIL LAN read-only API. SQL Server 2005 compatible via installed ODBC driver."""
 import json
 import os
+import logging
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
-try:
-    import pyodbc
-except ImportError:
-    raise SystemExit('Install pyodbc and an SQL Server-compatible ODBC driver')
+import pyodbc
 
 HOST = os.getenv('SSOIL_HOST', '0.0.0.0')
 PORT = int(os.getenv('SSOIL_PORT', '8765'))
 TOKEN = os.environ['SSOIL_API_TOKEN']
 ODBC = os.environ['SSOIL_ODBC_CONNECTION']
 
-# The sales table's quantities are aggregated once per product, as requested.
-# Confirm that SmP_S contains only the sales NOT already reflected in ART.Kolicina.
-PRODUCT_SQL = '''SELECT Art_ID, Naziv, PCena, Kolicina FROM dbo.ART'''
-BARCODE_SQL = '''SELECT Art_ID, BKod_ID FROM dbo.ART_BK'''
-SALE_SQL = '''SELECT Art_ID, SUM(Kolicina) FROM dbo.SmP_S GROUP BY Art_ID'''
-ONE_SQL = '''SELECT Art_ID, PCena, Kolicina FROM dbo.ART WHERE Art_ID = ?'''
-ONE_SALES_SQL = '''SELECT COALESCE(SUM(Kolicina), 0) FROM dbo.SmP_S WHERE Art_ID = ?'''
+PRODUCT_SQL = 'SELECT Art_ID, Naziv, PCena, Kolicina FROM dbo.ART'
+BARCODE_SQL = 'SELECT Art_ID, BKod_ID FROM dbo.ART_BK'
+ONE_SQL = 'SELECT Art_ID, PCena, Kolicina FROM dbo.ART WHERE Art_ID = ?'
+ONE_SALES_SQL = 'SELECT COALESCE(SUM(Kolicina), 0) FROM dbo.SmP_S WHERE Art_ID = ?'
 
 
 def conn():
-    # Explicit read-only connection intent. The SQL login MUST also have SELECT-only grants.
+    # This program executes SELECT statements only. Enforce SELECT-only permissions on SQL login too.
     return pyodbc.connect(ODBC, autocommit=True, timeout=10)
-
-
-def val(value):
-    if isinstance(value, Decimal):
-        return str(value)
-    return value
 
 
 def snapshot():
     with conn() as db:
         cur = db.cursor()
         rows = cur.execute(PRODUCT_SQL).fetchall()
-        products = {str(r[0]): {'id': str(r[0]), 'name': str(r[1] or ''),
-                   'price': str(r[2] or 0), 'stock': str(r[3] or 0), 'barcodes': []}
-                   for r in rows}
+        products = {
+            str(r[0]): {'id': str(r[0]), 'name': str(r[1] or ''),
+                        'price': str(r[2] if r[2] is not None else 0),
+                        'stock': str(r[3] if r[3] is not None else 0), 'barcodes': []}
+            for r in rows
+        }
         for art_id, barcode in cur.execute(BARCODE_SQL).fetchall():
-            if str(art_id) in products and barcode is not None:
+            item = products.get(str(art_id))
+            if item is not None and barcode is not None:
                 b = str(barcode).strip()
-                if b and b not in products[str(art_id)]['barcodes']:
-                    products[str(art_id)]['barcodes'].append(b)
+                if b and b not in item['barcodes']:
+                    item['barcodes'].append(b)
     return {'products': list(products.values())}
 
 
 def product(art_id):
     with conn() as db:
         cur = db.cursor()
-        row = cur.execute(ONE_SQL, (art_id,)).fetchone()
+        row = cur.execute(ONE_SQL, (int(art_id),)).fetchone()
         if row is None:
             return None
-        sold = cur.execute(ONE_SALES_SQL, (art_id,)).fetchone()[0] or 0
-        net = Decimal(str(row[3] or 0)) - Decimal(str(sold))
-        return {'id': str(row[0]), 'price': str(row[1] or 0),
-                'stock': str(net), 'art_stock': str(row[3] or 0), 'sales': str(sold)}
+        sold = cur.execute(ONE_SALES_SQL, (int(art_id),)).fetchone()[0] or 0
+        # ONE_SQL has three columns: 0=Art_ID, 1=PCena, 2=Kolicina.
+        art_stock = Decimal(str(row[2] if row[2] is not None else 0))
+        net = art_stock - Decimal(str(sold))
+        return {'id': str(row[0]), 'price': str(row[1] if row[1] is not None else 0),
+                'stock': str(net), 'art_stock': str(art_stock), 'sales': str(sold)}
 
 
 class Handler(BaseHTTPRequestHandler):
     def respond(self, status, data):
-        payload = json.dumps(data, ensure_ascii=False, default=val).encode('utf-8')
+        payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(payload)))
@@ -88,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, result) if result else self.respond(404, {'error': 'not found'})
             return self.respond(404, {'error': 'not found'})
         except Exception:
-            self.log_error('Database query failed')
+            logging.exception('Database query failed for %s', self.path)
             return self.respond(503, {'error': 'database unavailable or schema mismatch'})
 
     def do_POST(self):
