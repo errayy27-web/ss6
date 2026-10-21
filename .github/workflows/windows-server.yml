@@ -1,1 +1,30 @@
+name: SS OIL Windows Server EXE
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'pc_server/**'
+      - '.github/workflows/windows-server.yml'
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+      - name: Build standalone EXE
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pyodbc
+          python -m PyInstaller --noconfirm --clean --onefile --name SSOIL_Server --collect-all pyodbc pc_server/server.py
+          Copy-Item pc_server/BASLAT.bat dist/BASLAT.bat
+          Copy-Item pc_server/AYARLAR_ORNEK.bat dist/AYARLAR_ORNEK.bat
+          Copy-Item pc_server/EXE_KURULUM.md dist/EXE_KURULUM.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SS-OIL-Windows-Server-EXE
+          path: dist/*
 
